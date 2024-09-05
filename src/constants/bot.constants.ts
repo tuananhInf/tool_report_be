@@ -1,0 +1,3 @@
+export const BOT_ADDRESS = '0xEBE94ab981899EFBc8bb6cB2b045FC7490726Ff3';
+export const RONIN_RPC = '10.0.1.58:8745';
+export const ENDPOINT_DISCORD = ''

@@ -1,12 +1,12 @@
 import { Controller, Get } from '@nestjs/common';
-import { AppService } from './app.service';
+import { BotReportService } from './bot_report/bot-report.service';
 
-@Controller()
+@Controller('apps')
 export class AppController {
-  constructor(private readonly appService: AppService) {}
+  constructor(private readonly botReportService: BotReportService) {}
 
   @Get()
-  getHello(): string {
-    return this.appService.getHello();
+  async getHello(): Promise<any> {
+    return await this.botReportService.getBalancesAndReportTransactions();
   }
 }

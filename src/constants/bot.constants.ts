@@ -1,3 +1,5 @@
-export const BOT_ADDRESS = '0xEBE94ab981899EFBc8bb6cB2b045FC7490726Ff3';
-export const RONIN_RPC = '10.0.1.58:8745';
-export const ENDPOINT_DISCORD = ''
+export const BOT_ADDRESS = process.env.BOT_ADDRESS;
+export const RONIN_RPC = process.env.RONIN_RPC;
+export const ENDPOINT_DISCORD = '';
+export const BASE_URL_TRANSACTIONS = process.env.BASE_URL_TRANSACTIONS;
+export const BASE_URL_BALANCE = process.env.BASE_URL_BALANCE;

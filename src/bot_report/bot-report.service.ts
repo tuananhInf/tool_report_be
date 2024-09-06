@@ -1,43 +1,245 @@
 import { Web3 } from 'web3';
-import { RONIN_RPC } from '../constants/bot.constants';
+import * as moment from 'moment-timezone';
+import { ClientProxy } from '@nestjs/microservices';
+import { Inject, Injectable } from '@nestjs/common';
+import { rabbitmqConfig } from '../configs/rabbitmq.config';
+import { MevMessage } from './interfaces/mev-message.interface';
+import { Cron, CronExpression } from '@nestjs/schedule';
+
+@Injectable()
 export class BotReportService {
   private web3: Web3;
-  constructor() {
-    this.web3 = new Web3(new Web3.providers.HttpProvider(RONIN_RPC));
-  }
-  async getTodayTransactions(address: string) {
-    const latestBlock = await this.web3.eth.getBlockNumber();
-    const transactions = [];
-    const now = Math.floor(Date.now() / 1000);
-    const startOfDay = now - (now % 86400); // Đầu ngày hôm nay (UTC)
 
-    for (let i = latestBlock; i >= 0; i--) {
-      const block = await this.web3.eth.getBlock(i, true);
-      if (block && block.transactions) {
-        if (block.timestamp < startOfDay) {
-          break; // Dừng nếu đã đến block của ngày hôm trước
+  constructor(
+    @Inject('RABBITMQ_SERVICE') private readonly client: ClientProxy,
+  ) {
+    this.web3 = new Web3(
+      new Web3.providers.HttpProvider(process.env.RONIN_RPC),
+    );
+  }
+
+  async sendMevMessage(message: MevMessage) {
+    try {
+      return await this.client.emit<MevMessage>(
+        rabbitmqConfig.routingKey,
+        message,
+      );
+    } catch (error) {
+      console.error('Error sending message to RabbitMQ:', error);
+      throw error;
+    }
+  }
+
+  async sendDailyReport(data: string) {
+    const message: MevMessage = {
+      from: 'mev_daily_report',
+      module: 'Mev',
+      content: {
+        type: 'S1_Report',
+        level: 'INFO',
+        data: data,
+      },
+    };
+
+    return this.sendMevMessage(message);
+  }
+
+  async getTodayTransactions(
+    timestamp7HourPre: any,
+    timestamp7HourCurrent: any,
+  ) {
+    const limit = 25;
+    let offset = 0;
+    const transactionsFailed = [];
+    const transactionsSucceeded = [];
+
+    while (true) {
+      const endpoint = `${process.env.BASE_URL_TRANSACTIONS}${process.env.BOT_ADDRESS}/txs?offset=${offset}&limit=${limit}`;
+
+      // Gọi API
+      const response = await fetch(endpoint);
+      const data = await response.json();
+
+      if (
+        !data.result ||
+        !data.result.items ||
+        data.result.items.length === 0
+      ) {
+        // Không còn giao dịch nào nữa
+        break;
+      }
+
+      // Lọc và phân loại các giao dịch
+      for (const tx of data.result.items) {
+        const txTimestamp = tx.blockTime;
+
+        if (txTimestamp < timestamp7HourPre) {
+          // Đã đến giao dịch trước khoảng thời gian mong muốn, dừng vòng lặp
+          return {
+            transactionsFailed,
+            transactionsSucceeded,
+            failed: transactionsFailed.length,
+            success: transactionsSucceeded.length,
+          };
         }
-        for (const tx of block.transactions) {
-          const txParsed: any = tx;
-          if (
-            txParsed.from.toLowerCase() === address.toLowerCase() ||
-            (txParsed.to && txParsed.to.toLowerCase() === address.toLowerCase())
-          ) {
-            transactions.push(txParsed);
+
+        if (txTimestamp < timestamp7HourCurrent) {
+          if (tx.status === 0) {
+            transactionsFailed.push(tx);
+          } else {
+            transactionsSucceeded.push(tx);
           }
         }
       }
+
+      // Tăng offset cho lần gọi API tiếp theo
+      offset += limit;
     }
 
-    return transactions;
+    return {
+      transactionsFailed,
+      transactionsSucceeded,
+      failed: transactionsFailed.length,
+      success: transactionsSucceeded.length,
+    };
   }
 
-  // async getRoninBalance() {
-  // }
-  //
-  // async compareBalance(balancePre:any, balanceCurrent:any):Promise<any> {
-  //
-  // }
-  //
-  // async pushData(){}
+  getTimestamps(timezone: string = 'Asia/Ho_Chi_Minh') {
+    // Lấy ngày hiện tại trong múi giờ được chỉ định
+    const today = moment.tz(timezone);
+
+    // Đặt thời gian là 7 giờ sáng cho ngày hôm nay
+    const today7am = today
+      .clone()
+      .hours(7)
+      .minutes(0)
+      .seconds(0)
+      .milliseconds(0);
+
+    // Tính ngày hôm trước
+    const yesterday7am = today7am.clone().subtract(1, 'days');
+
+    // Chuyển đổi sang timestamp (số giây kể từ epoch)
+    const today7amTimestamp: number = today7am.unix();
+    const yesterday7amTimestamp: number = yesterday7am.unix();
+
+    return { today7amTimestamp, yesterday7amTimestamp };
+  }
+
+  // Hàm phụ trợ để tìm block gần nhất với một timestamp cụ thể
+  async findNearestBlockTo(targetTimestamp: number): Promise<number> {
+    const BLOCK_TIME = 3; // Thời gian trung bình giữa các block (giây)
+    const latestBlock = await this.web3.eth.getBlock();
+    const currentTimestamp = Number(latestBlock.timestamp.toString());
+    const blockNumberBigint = Number(latestBlock.number.toString());
+
+    // Ước tính số block giữa thời điểm hiện tại và 7h sáng
+    const timeDifference = Math.abs(currentTimestamp - targetTimestamp);
+    const estimatedBlocksAgo = Math.floor(timeDifference / BLOCK_TIME);
+
+    let estimatedTargetBlock = blockNumberBigint - estimatedBlocksAgo;
+    // Kiểm tra và điều chỉnh ước tính
+    let block = await this.web3.eth.getBlock(estimatedTargetBlock.toString());
+    // Điều chỉnh nếu ước tính chưa chính xác
+    while (Math.abs(Number(block.timestamp) - targetTimestamp) >= BLOCK_TIME) {
+      if (block.timestamp > targetTimestamp) {
+        estimatedTargetBlock--;
+      } else {
+        estimatedTargetBlock++;
+      }
+
+      block = await this.web3.eth.getBlock(estimatedTargetBlock);
+    }
+    return estimatedTargetBlock;
+  }
+
+  async makePostRequest(endpoint: string, body: any, method: string) {
+    const headers = {
+      'Content-Type': 'application/json',
+    };
+
+    try {
+      const response = await fetch(endpoint, {
+        method: method,
+        headers: headers,
+        body: body,
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+
+      const data = await response.json();
+      return data;
+    } catch (error) {
+      console.error('There was a problem with the fetch operation:', error);
+    }
+  }
+
+  async getRoninBalance(blockNumber: number) {
+    const endpoint = `${process.env.BASE_URL_BALANCE}${process.env.BOT_ADDRESS}/`;
+    const body = JSON.stringify({ blockNumber: blockNumber });
+    // Gọi API
+    const response = await this.makePostRequest(endpoint, body, 'POST');
+    const result = await response;
+    const balances = [];
+    for (const balance of result.data.balances) {
+      balances.push({
+        token: balance.tokenSymbol,
+        balance: balance.userBalance / 10 ** balance.tokenDecimals,
+      });
+    }
+    return balances;
+  }
+
+  @Cron(CronExpression.EVERY_DAY_AT_7AM)
+  async getBalancesAndReportTransactions() {
+    const MAX_RETRIES = 5;
+    const RETRY_DELAY = 60000; // 1 phút trong milliseconds
+
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        const { today7amTimestamp, yesterday7amTimestamp } =
+          this.getTimestamps();
+        const numberBlockPre = await this.findNearestBlockTo(
+          yesterday7amTimestamp,
+        );
+        const numberBlockCurrent =
+          await this.findNearestBlockTo(today7amTimestamp);
+        const balancesPre = await this.getRoninBalance(numberBlockPre);
+        const balancesCurrent = await this.getRoninBalance(numberBlockCurrent);
+
+        const difference = balancesCurrent.map((current, index) => ({
+          token: current.token,
+          difference_balance: current.balance - balancesPre[index].balance,
+        }));
+
+        const transactionReports = await this.getTodayTransactions(
+          yesterday7amTimestamp,
+          today7amTimestamp,
+        );
+        const { failed, success } = transactionReports;
+
+        return await this.sendDailyReport(
+          JSON.stringify({
+            failed,
+            success,
+            balances_yesterday: balancesPre,
+            balances_today: balancesCurrent,
+            difference,
+            date: new Date().toLocaleDateString(),
+          }),
+        );
+      } catch (error) {
+        console.error(`Attempt ${attempt} failed:`, error);
+
+        if (attempt === MAX_RETRIES) {
+          throw new Error('Max retries reached. Operation failed.');
+        }
+
+        console.log(`Retrying in ${RETRY_DELAY / 1000} seconds...`);
+        await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY));
+      }
+    }
+  }
 }

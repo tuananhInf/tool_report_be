@@ -1,11 +1,15 @@
 import { Web3 } from 'web3';
 import * as moment from 'moment-timezone';
 import { ClientProxy } from '@nestjs/microservices';
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, Logger } from '@nestjs/common';
 import { rabbitmqConfig } from '../configs/rabbitmq.config';
 import { MevMessage } from './interfaces/mev-message.interface';
 import { Cron, CronExpression } from '@nestjs/schedule';
 
+const LIMIT = 25;
+const BLOCK_TIME = 3; // Thời gian trung bình giữa các block (giây)
+const MAX_RETRIES = 5;
+const RETRY_DELAY = 60000; // 1 phút trong milliseconds
 @Injectable()
 export class BotReportService {
   private web3: Web3;
@@ -20,10 +24,9 @@ export class BotReportService {
 
   async sendMevMessage(message: MevMessage) {
     try {
-      return await this.client.emit<MevMessage>(
-        rabbitmqConfig.routingKey,
-        message,
-      );
+      await this.client.emit<MevMessage>(rabbitmqConfig.routingKey, message);
+      Logger.log('Send message successfully');
+      return { status: 'success' };
     } catch (error) {
       console.error('Error sending message to RabbitMQ:', error);
       throw error;
@@ -31,126 +34,141 @@ export class BotReportService {
   }
 
   async sendDailyReport(data: string) {
-    const message: MevMessage = {
-      from: 'mev_daily_report',
-      module: 'Mev',
-      content: {
-        type: 'S1_Report',
-        level: 'INFO',
-        data: data,
-      },
-    };
+    try {
+      const message: MevMessage = {
+        from: process.env.RABBITMQ_MESSAGE_FROM,
+        module: process.env.RABBITMQ_MESSAGE_MODULE,
+        content: {
+          type: process.env.RABBITMQ_CONTENT_TYPE,
+          level: process.env.RABBITMQ_CONTENT_LEVEL,
+          data: data,
+        },
+      };
 
-    return this.sendMevMessage(message);
+      return this.sendMevMessage(message);
+    } catch (e) {
+      throw e;
+    }
   }
 
   async getTodayTransactions(
     timestamp7HourPre: any,
     timestamp7HourCurrent: any,
   ) {
-    const limit = 25;
     let offset = 0;
-    const transactionsFailed = [];
-    const transactionsSucceeded = [];
+    try {
+      const transactionsFailed = [];
+      const transactionsSucceeded = [];
 
-    while (true) {
-      const endpoint = `${process.env.BASE_URL_TRANSACTIONS}${process.env.BOT_ADDRESS}/txs?offset=${offset}&limit=${limit}`;
+      while (true) {
+        const endpoint = `${process.env.BASE_URL_TRANSACTIONS}${process.env.BOT_ADDRESS}/txs?offset=${offset}&limit=${LIMIT}`;
 
-      // Gọi API
-      const response = await fetch(endpoint);
-      const data = await response.json();
+        // Gọi API
+        const response = await fetch(endpoint);
+        const data = await response.json();
 
-      if (
-        !data.result ||
-        !data.result.items ||
-        data.result.items.length === 0
-      ) {
-        // Không còn giao dịch nào nữa
-        break;
-      }
-
-      // Lọc và phân loại các giao dịch
-      for (const tx of data.result.items) {
-        const txTimestamp = tx.blockTime;
-
-        if (txTimestamp < timestamp7HourPre) {
-          // Đã đến giao dịch trước khoảng thời gian mong muốn, dừng vòng lặp
-          return {
-            transactionsFailed,
-            transactionsSucceeded,
-            failed: transactionsFailed.length,
-            success: transactionsSucceeded.length,
-          };
+        if (
+          !data.result ||
+          !data.result.items ||
+          data.result.items.length === 0
+        ) {
+          break;
         }
 
-        if (txTimestamp < timestamp7HourCurrent) {
-          if (tx.status === 0) {
-            transactionsFailed.push(tx);
-          } else {
-            transactionsSucceeded.push(tx);
+        // Lọc và phân loại các giao dịch
+        for (const tx of data.result.items) {
+          const txTimestamp = tx.blockTime;
+
+          if (txTimestamp < timestamp7HourPre) {
+            // Đã đến giao dịch trước khoảng thời gian mong muốn, dừng vòng lặp
+            return {
+              transactionsFailed,
+              transactionsSucceeded,
+              failed: transactionsFailed.length,
+              success: transactionsSucceeded.length,
+            };
+          }
+
+          if (txTimestamp < timestamp7HourCurrent) {
+            if (tx.status === 0) {
+              transactionsFailed.push(tx);
+            } else {
+              transactionsSucceeded.push(tx);
+            }
           }
         }
+
+        // Tăng offset cho lần gọi API tiếp theo
+        offset += LIMIT;
       }
 
-      // Tăng offset cho lần gọi API tiếp theo
-      offset += limit;
+      return {
+        transactionsFailed,
+        transactionsSucceeded,
+        failed: transactionsFailed.length,
+        success: transactionsSucceeded.length,
+      };
+    } catch (e) {
+      throw e;
     }
-
-    return {
-      transactionsFailed,
-      transactionsSucceeded,
-      failed: transactionsFailed.length,
-      success: transactionsSucceeded.length,
-    };
   }
 
   getTimestamps(timezone: string = 'Asia/Ho_Chi_Minh') {
-    // Lấy ngày hiện tại trong múi giờ được chỉ định
-    const today = moment.tz(timezone);
+    try {
+      // Lấy ngày hiện tại trong múi giờ được chỉ định
+      const today = moment.tz(timezone);
 
-    // Đặt thời gian là 7 giờ sáng cho ngày hôm nay
-    const today7am = today
-      .clone()
-      .hours(7)
-      .minutes(0)
-      .seconds(0)
-      .milliseconds(0);
+      // Đặt thời gian là 7 giờ sáng cho ngày hôm nay
+      const today7am = today
+        .clone()
+        .hours(7)
+        .minutes(0)
+        .seconds(0)
+        .milliseconds(0);
 
-    // Tính ngày hôm trước
-    const yesterday7am = today7am.clone().subtract(1, 'days');
+      // Tính ngày hôm trước
+      const yesterday7am = today7am.clone().subtract(1, 'days');
 
-    // Chuyển đổi sang timestamp (số giây kể từ epoch)
-    const today7amTimestamp: number = today7am.unix();
-    const yesterday7amTimestamp: number = yesterday7am.unix();
+      // Chuyển đổi sang timestamp (số giây kể từ epoch)
+      const today7amTimestamp: number = today7am.unix();
+      const yesterday7amTimestamp: number = yesterday7am.unix();
 
-    return { today7amTimestamp, yesterday7amTimestamp };
+      return { today7amTimestamp, yesterday7amTimestamp };
+    } catch (e) {
+      throw e;
+    }
   }
 
   // Hàm phụ trợ để tìm block gần nhất với một timestamp cụ thể
   async findNearestBlockTo(targetTimestamp: number): Promise<number> {
-    const BLOCK_TIME = 3; // Thời gian trung bình giữa các block (giây)
-    const latestBlock = await this.web3.eth.getBlock();
-    const currentTimestamp = Number(latestBlock.timestamp.toString());
-    const blockNumberBigint = Number(latestBlock.number.toString());
+    try {
+      const latestBlock = await this.web3.eth.getBlock();
+      const currentTimestamp = Number(latestBlock.timestamp.toString());
+      const blockNumberBigint = Number(latestBlock.number.toString());
 
-    // Ước tính số block giữa thời điểm hiện tại và 7h sáng
-    const timeDifference = Math.abs(currentTimestamp - targetTimestamp);
-    const estimatedBlocksAgo = Math.floor(timeDifference / BLOCK_TIME);
+      // Ước tính số block giữa thời điểm hiện tại và 7h sáng
+      const timeDifference = Math.abs(currentTimestamp - targetTimestamp);
+      const estimatedBlocksAgo = Math.floor(timeDifference / BLOCK_TIME);
 
-    let estimatedTargetBlock = blockNumberBigint - estimatedBlocksAgo;
-    // Kiểm tra và điều chỉnh ước tính
-    let block = await this.web3.eth.getBlock(estimatedTargetBlock.toString());
-    // Điều chỉnh nếu ước tính chưa chính xác
-    while (Math.abs(Number(block.timestamp) - targetTimestamp) >= BLOCK_TIME) {
-      if (block.timestamp > targetTimestamp) {
-        estimatedTargetBlock--;
-      } else {
-        estimatedTargetBlock++;
+      let estimatedTargetBlock = blockNumberBigint - estimatedBlocksAgo;
+      // Kiểm tra và điều chỉnh ước tính
+      let block = await this.web3.eth.getBlock(estimatedTargetBlock.toString());
+      // Điều chỉnh nếu ước tính chưa chính xác
+      while (
+        Math.abs(Number(block.timestamp) - targetTimestamp) >= BLOCK_TIME
+      ) {
+        if (block.timestamp > targetTimestamp) {
+          estimatedTargetBlock--;
+        } else {
+          estimatedTargetBlock++;
+        }
+
+        block = await this.web3.eth.getBlock(estimatedTargetBlock);
       }
-
-      block = await this.web3.eth.getBlock(estimatedTargetBlock);
+      return estimatedTargetBlock;
+    } catch (e) {
+      throw e;
     }
-    return estimatedTargetBlock;
   }
 
   async makePostRequest(endpoint: string, body: any, method: string) {
@@ -177,26 +195,27 @@ export class BotReportService {
   }
 
   async getRoninBalance(blockNumber: number) {
-    const endpoint = `${process.env.BASE_URL_BALANCE}${process.env.BOT_ADDRESS}/`;
-    const body = JSON.stringify({ blockNumber: blockNumber });
-    // Gọi API
-    const response = await this.makePostRequest(endpoint, body, 'POST');
-    const result = await response;
-    const balances = [];
-    for (const balance of result.data.balances) {
-      balances.push({
-        token: balance.tokenSymbol,
-        balance: balance.userBalance / 10 ** balance.tokenDecimals,
-      });
+    try {
+      const endpoint = `${process.env.BASE_URL_BALANCE}${process.env.BOT_ADDRESS}/`;
+      const body = JSON.stringify({ blockNumber: blockNumber });
+      // Gọi API
+      const response = await this.makePostRequest(endpoint, body, 'POST');
+      const result = await response;
+      const balances = [];
+      for (const balance of result.data.balances) {
+        balances.push({
+          token: balance.tokenSymbol,
+          balance: balance.userBalance / 10 ** balance.tokenDecimals,
+        });
+      }
+      return balances;
+    } catch (error) {
+      throw error;
     }
-    return balances;
   }
 
   @Cron(CronExpression.EVERY_DAY_AT_7AM)
   async getBalancesAndReportTransactions() {
-    const MAX_RETRIES = 5;
-    const RETRY_DELAY = 60000; // 1 phút trong milliseconds
-
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
       try {
         const { today7amTimestamp, yesterday7amTimestamp } =
